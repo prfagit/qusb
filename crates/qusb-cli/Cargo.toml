@@ -10,6 +10,11 @@ repository.workspace = true
 name = "qusb"
 path = "src/main.rs"
 
+[features]
+# Lets QUSB_TEST_PASS and QUSB_TEST_WORDS stand in for the passphrase and word prompts, for scripted
+# tests. Never enable it in a build that will hold funds.
+test-hooks = []
+
 [dependencies]
 qusb-core = { path = "../qusb-core" }
 clap = { version = "4", features = ["derive", "env"] }

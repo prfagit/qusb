@@ -1,0 +1,17 @@
+# cargo-deny: known advisories and crate sources for what ships (the CLI and the program).
+# Run: cargo deny check advisories sources
+
+[graph]
+# Dev-dependencies are left out. The qvault tests pull in litesvm and the Agave runtime,
+# which carry "unmaintained" notices with no fix available (RUSTSEC-2021-0139 ansi_term,
+# RUSTSEC-2025-0141 bincode 1.x, RUSTSEC-2024-0388 derivative, RUSTSEC-2025-0161
+# libsecp256k1, RUSTSEC-2024-0436 paste) and one "unsound" notice (RUSTSEC-2026-0097
+# rand 0.7). None of that code is in the qusb binary or the on-chain program.
+exclude-dev = true
+
+[advisories]
+ignore = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

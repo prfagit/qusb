@@ -9,8 +9,12 @@ pub enum Error {
     Mnemonic(String),
     #[error("wrong passphrase or corrupted data")]
     Decrypt,
-    #[error("vault index {0} was already used")]
+    #[error("vault {0} was already used and this keystore has no record of what it signed; signing again could publish a second signature")]
     AlreadyUsed(u32),
+    #[error("vault {} already signed a different withdrawal", .0.vault)]
+    SignedOther(keystore::Spend),
+    #[error("{0}")]
+    Refused(String),
     #[error("keystore already exists")]
     Exists,
     #[error("bad format: {0}")]
@@ -28,9 +32,12 @@ pub mod b58 {
     pub fn enc(b: &[u8]) -> String {
         bs58::encode(b).into_string()
     }
+    pub fn dec(s: &str) -> crate::Result<Vec<u8>> {
+        bs58::decode(s).into_vec().map_err(crate::fmt_err)
+    }
     pub fn dec32(s: &str) -> crate::Result<[u8; 32]> {
-        let v = bs58::decode(s).into_vec().map_err(crate::fmt_err)?;
-        v.try_into()
+        dec(s)?
+            .try_into()
             .map_err(|_| crate::fmt_err("expected 32 bytes"))
     }
 }
@@ -125,6 +132,11 @@ pub mod derive {
     pub fn program_id() -> [u8; 32] {
         b58::dec32(QVAULT_PROGRAM_ID).unwrap()
     }
+
+    /// Address of vault `k` under the built-in program.
+    pub fn vault(seed64: &[u8; 64], k: u32) -> [u8; 32] {
+        vault_address(&vault_pk_hash(seed64, k), &program_id())
+    }
 }
 
 pub mod keystore {
@@ -138,13 +150,37 @@ pub mod keystore {
     use serde::{Deserialize, Serialize};
     use std::{fs, io::Write, path::Path};
 
-    #[derive(Serialize, Deserialize)]
+    /// Vault indices stay below this, far from u32 overflow. Reaching it takes tens of thousands of signatures.
+    pub const MAX_VAULT: u32 = 1_000_000;
+    /// A restore stops after this many vaults in a row with no history, so it reaches `next_vault` to
+    /// `next_vault + SCAN_GAP - 1`. `withdraw::plan` signs from no index beyond that window.
+    pub const SCAN_GAP: u32 = 20;
+
+    /// What a used vault key signed. WOTS signing is deterministic, so this exact spend can be written
+    /// again without publishing anything new; nothing else may ever be signed with that key.
+    #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+    pub struct Spend {
+        pub vault: u32,
+        pub recipient: String,
+        pub refund: String,
+        /// decimal lamports or "max", as in the .qsig
+        pub amount: String,
+    }
+
+    #[derive(Serialize, Deserialize, Default)]
     pub struct Secrets {
         pub mnemonic: Zeroizing<String>,
         pub created: u64,
         pub label: String,
         pub next_vault: u32,
         pub used: Vec<u32>,
+        /// Added after v0.1.0, which reads and writes only the fields above. A used vault with no
+        /// entry here (signed by v0.1.0, or marked by a restore) can never be signed again.
+        #[serde(default)]
+        pub spends: Vec<Spend>,
+        /// Vaults below this were marked used by an offline restore with no chain evidence; a rescan clears it.
+        #[serde(default)]
+        pub assumed_used_below: u32,
     }
 
     /// Argon2id params. `Default` is the SPEC §1 value; lower only in tests.
@@ -185,6 +221,11 @@ pub mod keystore {
         ct: String,
     }
 
+    /// Upper bounds accepted from a keystore file: 1 GiB, 64 passes, 16 lanes.
+    pub const MAX_M_KIB: u32 = 1 << 20;
+    pub const MAX_T: u32 = 64;
+    pub const MAX_P: u32 = 16;
+
     fn aad(m: u32, t: u32, p: u32) -> String {
         format!("qusb:1:argon2id:{m}:{t}:{p}")
     }
@@ -192,7 +233,8 @@ pub mod keystore {
         dir.join("vault.qv")
     }
 
-    pub(crate) fn atomic_write(p: &Path, data: &[u8]) -> Result<()> {
+    /// Write `<p>.tmp`, fsync, rename over `p`, then fsync the directory so the rename survives a pulled stick.
+    pub fn atomic_write(p: &Path, data: &[u8]) -> Result<()> {
         let mut name = p.file_name().unwrap().to_os_string();
         name.push(".tmp");
         let tmp = p.with_file_name(name);
@@ -201,6 +243,11 @@ pub mod keystore {
         f.sync_all()?;
         drop(f);
         fs::rename(&tmp, p)?;
+        // Best effort: some FAT/exFAT drivers cannot fsync a directory, and the file itself is already synced.
+        #[cfg(unix)]
+        if let Some(d) = p.parent() {
+            let _ = fs::File::open(d).and_then(|d| d.sync_all());
+        }
         Ok(())
     }
 
@@ -246,10 +293,15 @@ pub mod keystore {
         atomic_write(&path(dir), &serde_json::to_vec_pretty(&f).map_err(fmt_err)?)
     }
 
-    fn read_file(dir: &Path) -> Result<File> {
-        let f: File = serde_json::from_slice(&fs::read(path(dir))?).map_err(fmt_err)?;
+    fn read_file(p: &Path) -> Result<File> {
+        let f: File = serde_json::from_slice(&fs::read(p)?).map_err(fmt_err)?;
         if f.qusb != 1 || f.kdf.alg != "argon2id" || f.aead.alg != "xchacha20poly1305" {
             return Err(fmt_err("unsupported keystore"));
+        }
+        // The file is not authenticated until the AEAD check, which comes after the KDF: an edited
+        // file must not make us allocate gigabytes or hash for hours first.
+        if f.kdf.m_kib > MAX_M_KIB || f.kdf.t > MAX_T || f.kdf.p > MAX_P {
+            return Err(fmt_err("keystore KDF parameters are out of range"));
         }
         Ok(f)
     }
@@ -265,8 +317,32 @@ pub mod keystore {
         write(dir, s, pass, k)
     }
 
+    /// Also finishes a write that was cut short (stick pulled before the rename reached the disk),
+    /// which leaves `vault.qv.tmp`. A leftover that decrypts is complete, and it is the newest state:
+    /// it may record a signature the old `vault.qv` does not know about, so it wins. One that does
+    /// not decrypt under a passphrase that opens `vault.qv` is a partial write and is removed.
     pub fn unlock(dir: &Path, pass: &str) -> Result<Secrets> {
-        let f = read_file(dir)?;
+        let (main, tmp) = (unlock_file(&path(dir), pass), dir.join("vault.qv.tmp"));
+        if tmp.is_file() {
+            match unlock_file(&tmp, pass) {
+                Ok(s) => {
+                    fs::rename(&tmp, path(dir)).map_err(recover_err)?;
+                    return Ok(s);
+                }
+                Err(_) if main.is_ok() => fs::remove_file(&tmp).map_err(recover_err)?,
+                Err(e) if !path(dir).is_file() => return Err(e),
+                Err(_) => {}
+            }
+        }
+        main
+    }
+
+    fn recover_err(e: std::io::Error) -> Error {
+        Error::Refused(format!("the last write to this stick was cut short and left qusb/vault.qv.tmp, which could not be cleaned up ({e}). Is the stick read-only? Make it writable and run the command again"))
+    }
+
+    fn unlock_file(p: &Path, pass: &str) -> Result<Secrets> {
+        let f = read_file(p)?;
         let salt = B64.decode(&f.kdf.salt).map_err(fmt_err)?;
         let nonce = B64.decode(&f.aead.nonce).map_err(fmt_err)?;
         let ct = B64.decode(&f.ct).map_err(fmt_err)?;
@@ -294,7 +370,7 @@ pub mod keystore {
 
     /// Re-encrypts with fresh salt+nonce, keeping the KDF params of the existing file (SPEC defaults if none).
     pub fn save(dir: &Path, s: &Secrets, pass: &str) -> Result<()> {
-        let k = read_file(dir)
+        let k = read_file(&path(dir))
             .map(|f| KdfParams {
                 m_kib: f.kdf.m_kib,
                 t: f.kdf.t,
@@ -304,13 +380,21 @@ pub mod keystore {
         write(dir, s, pass, &k)
     }
 
-    /// In-memory; caller must `save` BEFORE signing. Err(AlreadyUsed) if `k` is already recorded.
-    pub fn mark_used(s: &mut Secrets, k: u32) -> Result<()> {
-        if s.used.contains(&k) {
-            return Err(Error::AlreadyUsed(k));
+    /// In-memory; caller must `save` BEFORE signing. Err(AlreadyUsed) if the vault is already recorded.
+    pub fn mark_used(s: &mut Secrets, sp: Spend) -> Result<()> {
+        if s.used.contains(&sp.vault) {
+            return Err(Error::AlreadyUsed(sp.vault));
         }
-        s.used.push(k);
+        s.used.push(sp.vault);
+        s.spends.push(sp);
         Ok(())
+    }
+
+    /// The vault `receive` hands out: the first index at or after `next_vault` that has not signed.
+    pub fn next_fresh(s: &Secrets) -> u32 {
+        (s.next_vault..)
+            .find(|i| !s.used.contains(i))
+            .expect("u32 range")
     }
 }
 
@@ -337,11 +421,14 @@ pub mod public {
     }
 
     /// Lists vaults 0..=max(next_vault, last used + 1); `used` ones are marked used, the rest fresh.
+    /// ponytail: every listed vault is derived again on each call (a few thousand hashes each).
+    /// Fine for the hundreds of vaults a stick sees; cache the addresses if that ever grows.
     pub fn build(s: &keystore::Secrets) -> PublicInfo {
         let seed = mnemonic::seed64(&s.mnemonic);
         let prog = derive::program_id();
-        let n = s.next_vault.max(s.used.iter().max().map_or(0, |m| m + 1)) + 1;
-        let vaults = (0..n)
+        let last_used = s.used.iter().max().map_or(0, |m| m.saturating_add(1));
+        let top = s.next_vault.max(last_used).min(keystore::MAX_VAULT);
+        let vaults = (0..=top)
             .map(|i| {
                 let pk = derive::vault_pk_hash(&seed, i);
                 VaultInfo {
@@ -410,15 +497,93 @@ pub mod withdraw {
 
     impl QSig {
         pub fn amount_u64(&self) -> Result<u64> {
-            if self.amount == "max" {
-                Ok(u64::MAX)
-            } else {
-                self.amount.parse().map_err(fmt_err)
-            }
+            parse_amount(&self.amount)
         }
     }
 
-    /// Does NOT touch the keystore: the caller must `mark_used` + `save` first. `amount == u64::MAX` means "max".
+    /// "max" or decimal lamports; `u64::MAX` means "max".
+    pub fn parse_amount(s: &str) -> Result<u64> {
+        if s == "max" {
+            Ok(u64::MAX)
+        } else {
+            s.parse().map_err(fmt_err)
+        }
+    }
+    pub fn amount_str(amount: u64) -> String {
+        if amount == u64::MAX {
+            "max".into()
+        } else {
+            amount.to_string()
+        }
+    }
+
+    /// A withdrawal that passed every rule that must hold before a one-time key is spent.
+    /// `refund_index` is None when vault `k` already signed exactly this: sign it again, mark nothing.
+    #[derive(Debug)]
+    pub struct Plan {
+        pub spend: keystore::Spend,
+        pub refund_index: Option<u32>,
+    }
+
+    /// The shared gate for `sign` and `send`. Picks the refund vault and refuses anything the
+    /// program would reject forever (SPEC §3 step 4) or that would need a second signature.
+    pub fn plan(s: &keystore::Secrets, k: u32, recipient: &[u8; 32], amount: u64) -> Result<Plan> {
+        use keystore::{Spend, MAX_VAULT, SCAN_GAP};
+        let (to, amount) = (b58::enc(recipient), amount_str(amount));
+        if s.used.contains(&k) {
+            return match s.spends.iter().find(|x| x.vault == k) {
+                Some(x) if x.recipient == to && x.amount == amount => Ok(Plan {
+                    spend: x.clone(),
+                    refund_index: None,
+                }),
+                Some(x) => Err(Error::SignedOther(x.clone())),
+                None => Err(Error::AlreadyUsed(k)),
+            };
+        }
+        if k >= MAX_VAULT || k >= s.next_vault.saturating_add(SCAN_GAP) {
+            return Err(Error::Refused(format!(
+                "vault {k} is {SCAN_GAP} or more past the next vault this stick knows ({}), where a restore would not find it; if it holds funds, run `qusb rescan` online first",
+                s.next_vault
+            )));
+        }
+        let seed = mnemonic::seed64(&s.mnemonic);
+        if derive::vault(&seed, k) == *recipient {
+            return Err(Error::Refused(
+                "the recipient is the vault itself; nothing was signed".into(),
+            ));
+        }
+        if let Some(u) = s
+            .used
+            .iter()
+            .find(|&&u| derive::vault(&seed, u) == *recipient)
+        {
+            return Err(Error::Refused(format!(
+                "the recipient is vault {u} of this stick, which has already signed: anyone could replay that signature and move the funds. Use `qusb receive` for a fresh address"
+            )));
+        }
+        // The refund is the next vault nobody has signed from. `receive` shows that same vault, so a
+        // send to your own receive address would make recipient == refund: move the refund one further.
+        let mut r = s.next_vault.max(k + 1);
+        while r < MAX_VAULT && (s.used.contains(&r) || derive::vault(&seed, r) == *recipient) {
+            r += 1;
+        }
+        if r >= MAX_VAULT {
+            return Err(Error::Refused(
+                "this stick has run out of vault indices".into(),
+            ));
+        }
+        Ok(Plan {
+            spend: Spend {
+                vault: k,
+                recipient: to,
+                refund: b58::enc(&derive::vault(&seed, r)),
+                amount,
+            },
+            refund_index: Some(r),
+        })
+    }
+
+    /// Does NOT touch the keystore: the caller must `plan`, `mark_used` + `save` first. `amount == u64::MAX` means "max".
     pub fn sign(
         seed64: &[u8; 64],
         vault_index: u32,
@@ -437,13 +602,64 @@ pub mod withdraw {
             vault_index,
             recipient: b58::enc(recipient),
             refund: b58::enc(refund),
-            amount: if amount == u64::MAX {
-                "max".into()
-            } else {
-                amount.to_string()
-            },
+            amount: amount_str(amount),
             sig: B64.encode(qusb_wots::sig_to_bytes(&sig)),
         }
+    }
+
+    /// A .qsig that is safe to wrap in a transaction.
+    pub struct Checked {
+        pub vault: [u8; 32],
+        pub recipient: [u8; 32],
+        pub refund: [u8; 32],
+        pub amount: u64,
+        pub ix_data: Vec<u8>,
+    }
+
+    /// Everything `broadcast` must know before it signs a transaction around a file from anywhere:
+    /// known version and kind, the built-in program, and a WOTS signature over the rebuilt message
+    /// that recovers the vault named in the file.
+    pub fn check(q: &QSig) -> Result<Checked> {
+        if q.qusb != 1 || q.kind != "qvault-withdraw" {
+            return Err(fmt_err("unknown .qsig version or kind"));
+        }
+        if q.program != derive::QVAULT_PROGRAM_ID {
+            return Err(Error::Refused(format!(
+                "this .qsig names program {}, not the qvault program {}",
+                q.program,
+                derive::QVAULT_PROGRAM_ID
+            )));
+        }
+        let (vault, recipient, refund) = (
+            b58::dec32(&q.vault)?,
+            b58::dec32(&q.recipient)?,
+            b58::dec32(&q.refund)?,
+        );
+        if vault == recipient || vault == refund || recipient == refund {
+            return Err(Error::Refused(
+                "vault, recipient and refund must be three different addresses".into(),
+            ));
+        }
+        let amount = q.amount_u64()?;
+        let ix_data = ix_data(q)?;
+        let sig = qusb_wots::sig_from_bytes(&ix_data[1..1 + qusb_wots::SIG_LEN]).unwrap();
+        let pk = qusb_wots::recover_pk_hash::<qusb_wots::Sha2>(
+            &sig,
+            &message(&vault, &recipient, &refund, amount),
+        );
+        if derive::vault_address(&pk, &derive::program_id()) != vault {
+            return Err(Error::Refused(
+                "the signature does not match the vault, recipient, refund and amount in this .qsig"
+                    .into(),
+            ));
+        }
+        Ok(Checked {
+            vault,
+            recipient,
+            refund,
+            amount,
+            ix_data,
+        })
     }
 
     /// 849-byte instruction data: tag 0 | sig 840 | amount u64 LE.
@@ -456,6 +672,31 @@ pub mod withdraw {
         d.extend_from_slice(&sig);
         d.extend_from_slice(&q.amount_u64()?.to_le_bytes());
         Ok(d)
+    }
+
+    /// Inverse of `ix_data`: the .qsig behind a Withdraw instruction seen on chain. Nothing is
+    /// verified here; pass the result to `check`.
+    pub fn from_ix(
+        vault_index: u32,
+        vault: &str,
+        recipient: &str,
+        refund: &str,
+        data: &[u8],
+    ) -> Option<QSig> {
+        let (sig, amount) = data
+            .strip_prefix(&[0])?
+            .split_at_checked(qusb_wots::SIG_LEN)?;
+        Some(QSig {
+            qusb: 1,
+            kind: "qvault-withdraw".into(),
+            program: derive::QVAULT_PROGRAM_ID.into(),
+            vault: vault.into(),
+            vault_index,
+            recipient: recipient.into(),
+            refund: refund.into(),
+            amount: amount_str(u64::from_le_bytes(amount.try_into().ok()?)),
+            sig: B64.encode(sig),
+        })
     }
 }
 
@@ -515,6 +756,15 @@ pub mod seal {
     /// base64 of ml-kem ek (1184) ‖ x25519 pub (32).
     pub fn encode_pub(p: &SealPub) -> String {
         B64.encode([&p.mlkem[..], &p.x25519].concat())
+    }
+    /// Short fingerprint to compare over a second channel before sealing to a key.
+    pub fn fingerprint(p: &SealPub) -> String {
+        let h = hex::encode(&Sha256::digest([&p.mlkem[..], &p.x25519].concat())[..10]);
+        h.as_bytes()
+            .chunks(4)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
     pub fn decode_pub(s: &str) -> Result<SealPub> {
         let b = B64.decode(s.trim()).map_err(fmt_err)?;
@@ -580,9 +830,13 @@ pub mod stick {
     use std::path::{Path, PathBuf};
     /// Walks up from `start` looking for `<dir>/qusb/vault.qv`; returns the `qusb/` directory.
     pub fn find(start: &Path) -> Option<PathBuf> {
+        find_file(start, "vault.qv")
+    }
+    /// Same walk for another file in `qusb/`, e.g. the `vault.qv.tmp` an interrupted write leaves.
+    pub fn find_file(start: &Path, name: &str) -> Option<PathBuf> {
         start
             .ancestors()
             .map(|d| d.join("qusb"))
-            .find(|d| d.join("vault.qv").is_file())
+            .find(|d| d.join(name).is_file())
     }
 }

@@ -16,6 +16,7 @@ solana-sha256-hasher = "3.1"
 
 [dev-dependencies]
 qusb-wots = { path = "../../crates/qusb-wots" }
+qusb-core = { path = "../../crates/qusb-core" } # tests sign through the same code the CLI ships
 litesvm = "=0.11.0"
 solana-address = { version = "2", features = ["curve25519"] }
 solana-keypair = "3"

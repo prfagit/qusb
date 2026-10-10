@@ -4,6 +4,18 @@ use qusb_core::b58;
 
 pub const MAX_TX: usize = 1232;
 pub const SYSTEM: [u8; 32] = [0; 32];
+pub const CU_LIMIT: u32 = 1_400_000;
+/// Lamports per signature; every transaction here has one.
+pub const BASE_FEE: u64 = 5000;
+
+/// The most a withdraw transaction can cost its fee payer. The priority fee is charged on the
+/// compute unit limit, not on the units used.
+pub fn max_fee(micro_price: u64) -> u64 {
+    let prio = (CU_LIMIT as u128 * micro_price as u128).div_ceil(1_000_000);
+    u64::try_from(prio)
+        .unwrap_or(u64::MAX)
+        .saturating_add(BASE_FEE)
+}
 
 pub fn compute_budget() -> [u8; 32] {
     b58::dec32("ComputeBudget111111111111111111111111111111").unwrap()
@@ -41,20 +53,20 @@ fn compact(out: &mut Vec<u8>, n: usize) {
     }
 }
 
-/// Compute-budget instructions (limit, then optional price) followed by the qvault Withdraw.
+/// Compute-budget instructions (limit, then price) followed by the qvault Withdraw. The program is
+/// always the built-in qvault id: a .qsig never chooses what the fee payer's signature runs.
 pub fn withdraw_ixs(
     payer: [u8; 32],
     vault: [u8; 32],
     recipient: [u8; 32],
     refund: [u8; 32],
-    program: [u8; 32],
     data: Vec<u8>,
     micro_price: u64,
 ) -> Vec<Ix> {
-    let mut v = vec![budget(2, &1_400_000u32.to_le_bytes())];
+    let mut v = vec![budget(2, &CU_LIMIT.to_le_bytes())];
     v.push(budget(3, &micro_price.to_le_bytes()));
     v.push(Ix {
-        program,
+        program: qusb_core::derive::program_id(),
         accounts: vec![
             m(payer, true, true),
             m(vault, false, true),
@@ -151,8 +163,9 @@ mod tests {
     fn withdraw_tx_layout() {
         let payer = SigningKey::from_bytes(&[7; 32]);
         let pk = payer.verifying_key().to_bytes();
-        let (vault, rec, refund, prog) = ([1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]);
-        let ixs = withdraw_ixs(pk, vault, rec, refund, prog, vec![0u8; 849], 1000);
+        let (vault, rec, refund) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let prog = qusb_core::derive::program_id();
+        let ixs = withdraw_ixs(pk, vault, rec, refund, vec![0u8; 849], 1000);
         let msg = message(pk, [9; 32], &ixs);
         let tx = sign(&payer, &msg).unwrap();
         assert!(tx.len() <= MAX_TX, "{}", tx.len());
@@ -177,5 +190,13 @@ mod tests {
         let rest = &msg[4 + 256..];
         assert_eq!(rest[0], 3); // three instructions
         assert_eq!(&rest[1..9], &[5, 0, 5, 2, 0xc0, 0x5c, 0x15, 0]); // limit ix: program 5, no accounts, [2, 1_400_000 LE]
+    }
+
+    #[test]
+    fn fee_ceiling() {
+        assert_eq!(max_fee(0), 5000);
+        assert_eq!(max_fee(1), 5002); // 1.4 lamports, rounded up
+        assert_eq!(max_fee(1_000_000), 1_405_000);
+        assert_eq!(max_fee(u64::MAX), u64::MAX);
     }
 }

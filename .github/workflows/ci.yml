@@ -2,33 +2,49 @@ name: ci
 on:
   push:
   pull_request:
+  workflow_call: # release.yml runs these jobs before it builds a tag
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   AGAVE_VERSION: v4.0.2 # pinned stable; bump deliberately
+  # sha256 of the program deployed on mainnet (README, "Verify the on-chain program")
+  QVAULT_SHA256: 5581547af0d5d03e43de1f4605f25914d92dcb8989f070470a70f212a3a4d4ea
 
 jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo fmt --all --check
       - run: cargo clippy --workspace --exclude qvault -- -D warnings
       - run: cargo test --workspace --exclude qvault
 
   program:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install Agave toolchain
         run: |
           sh -c "$(curl -sSfL https://release.anza.xyz/${AGAVE_VERSION}/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
       - run: cargo-build-sbf --manifest-path programs/qvault/Cargo.toml
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: qvault.so
+          path: target/deploy/qvault.so
+          if-no-files-found: error
+      - name: Built program matches the deployed bytes
+        run: echo "${QVAULT_SHA256}  target/deploy/qvault.so" | sha256sum -c -
       - run: cargo test -p qvault

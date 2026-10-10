@@ -10,29 +10,136 @@ This stick is a vault. Not a backup of one. The vault.
 Nothing here phones home. Nothing here needs install.
 The program lives in bin/. The secrets will live in qusb/.
 
-FIRST RUN (once, on a machine you trust, ideally offline)
----------------------------------------------------------
-Open a terminal in this stick's folder, then run the line for your OS.
-<STICK> is this stick's mount path.
+Open a terminal in this stick's folder. Below, QUSB stands for the
+program for your machine, and <STICK> for this stick's mount path.
 
-  macOS (Apple silicon)   bin/qusb-macos-arm64 init <STICK>
-  macOS (Intel)           bin/qusb-macos-x64 init <STICK>
-  Linux (x64)             bin/qusb-linux-x64 init <STICK>
-  Linux (arm64)           bin/qusb-linux-arm64 init <STICK>
-  Windows (x64)           bin\qusb-windows-x64.exe init <STICK>
+  macOS (Apple silicon)   bin/qusb-macos-arm64
+  macOS (Intel)           bin/qusb-macos-x64
+  Linux (x64)             bin/qusb-linux-x64
+  Linux (arm64)           bin/qusb-linux-arm64
+  Windows (x64)           bin\qusb-windows-x64.exe
 
 macOS/Linux may need: chmod +x bin/qusb-*
-Check the binaries first:  bin/qusb-<os> verify
 
 THE GOLDEN RULES
 ----------------
 1. Write the 24 words on paper. Ink. Twice, two places.
 2. Never photograph them. Never type them into anything but qusb.
 3. A vault key signs once. After that it is spent. This is the point.
-4. The classic lane is quantum-exposed. Treat it as a hot pocket,
+4. Use each address once. Never send to an address you have already
+   spent from: anyone can replay its old signature and move what
+   lands there to the old recipient.
+5. The classic lane is quantum-exposed. Treat it as a hot pocket,
    not a safe.
-5. Lose the stick: the words restore everything.
+6. Eject the stick safely before you unplug it, every time.
+7. Lose the stick: the words restore everything.
    Lose the words: nothing does.
+
+1. CHECK THE PROGRAMS
+---------------------
+  QUSB verify
+
+Every file must say "ok". This catches a damaged copy. It cannot
+catch a stick someone tampered with on purpose: for that, compare
+bin/SHA256SUMS with the release page on GitHub.
+
+2. CREATE THE VAULT (once, on a machine you trust, ideally offline)
+-------------------------------------------------------------------
+  QUSB init <STICK>
+
+It shows 24 words once, asks for three of them back, then asks for
+a passphrase. The passphrase unlocks this stick. The words rebuild
+it if the stick is lost.
+
+3. RECEIVE
+----------
+  QUSB receive
+
+Shows your next unused vault address and a QR code. Send SOL to it
+from any wallet or exchange. It also shows the classic address.
+
+  QUSB status
+
+Lists every vault and its balance. No passphrase needed.
+
+4. PUT A LITTLE SOL ON THE CLASSIC ADDRESS
+------------------------------------------
+Sending costs a network fee, and a vault cannot pay it. Send about
+0.002 SOL to the classic address from step 3. The network makes it
+keep about 0.0009 SOL; the rest covers a few hundred sends. Skip
+this if you will pay fees from another wallet's keypair file.
+
+5. SEND, THE SHORT WAY (one online machine)
+-------------------------------------------
+  QUSB send --vault 0 --to <ADDRESS> --amount 1.5
+
+Use --amount max to send everything. qusb shows what will happen and
+waits for you to type yes. If you send only part, the rest moves to
+your next vault, shown as "refund": vault 1 here. Vault 0 is then
+spent for good. QUSB status shows where your SOL sits now.
+
+6. SEND, THE COLD WAY (sign offline, broadcast online)
+------------------------------------------------------
+On the offline machine:
+
+  QUSB sign --vault 1 --to <ADDRESS> --amount max
+
+This writes qusb/sigs/vault1.qsig on the stick. The file holds no
+secret. It can pay only the recipient written inside it, so it is
+safe to copy to another drive or send to yourself. Keep a copy of
+it somewhere off the stick until it has been broadcast.
+
+On the online machine:
+
+  QUSB broadcast qusb/sigs/vault1.qsig --payer stick
+
+qusb checks the file, shows where the money goes and the maximum
+fee, and waits for yes. --payer stick unlocks the stick on that
+machine to pay the fee. To keep the stick away from the online
+machine, copy the .qsig over and pay with a keypair file instead:
+--payer keypair.json
+
+If a send fails after signing, nothing is lost. The .qsig stays
+valid: fix the cause and run broadcast again. If qusb says "status
+unknown", look up the printed signature on a block explorer before
+you retry.
+
+A new recipient must receive at least 0.00089088 SOL, or the
+network rejects the send.
+
+7. EJECT
+--------
+Eject the stick in your system before you pull it out. qusb reminds
+you whenever it has written to the stick. A stick pulled too early
+can lose the record of which vaults are spent.
+
+8. LOST THE STICK
+-----------------
+On a new stick, online:
+
+  QUSB init <STICK> --restore
+
+Type the 24 words. qusb reads the chain, finds the vaults you have
+spent and the ones that still hold SOL, and continues after them.
+It believes what the RPC node says, so use one you trust. qusb
+refuses a node that does not keep full history.
+
+Offline it cannot know which vaults are spent, so you must tell it:
+
+  QUSB init <STICK> --restore --next-vault 20
+
+Use a number above every vault you ever used. Vaults below it stay
+locked until you go online and run:
+
+  QUSB rescan
+
+It lists the vaults it is about to unlock and waits for you to type
+yes.
+
+If you signed a .qsig and never broadcast it, the chain does not
+show it. If you still have a copy of that .qsig, broadcast it.
+Otherwise empty that vault in a single send --amount max and never
+fund it again.
 
 https://qusb.app
 https://github.com/prfagit/qusb

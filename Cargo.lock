@@ -509,6 +509,7 @@ dependencies = [
  "bitcoin_hashes",
  "serde",
  "unicode-normalization",
+ "zeroize",
 ]
 
 [[package]]
@@ -2181,7 +2182,7 @@ dependencies = [
 
 [[package]]
 name = "qusb-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -2199,7 +2200,7 @@ dependencies = [
 
 [[package]]
 name = "qusb-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -2223,7 +2224,7 @@ dependencies = [
 
 [[package]]
 name = "qusb-wots"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "sha2 0.10.9",
  "zeroize",
@@ -2231,12 +2232,13 @@ dependencies = [
 
 [[package]]
 name = "qvault"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bincode",
  "litesvm",
  "pinocchio",
  "pinocchio-system",
+ "qusb-core",
  "qusb-wots",
  "solana-address 2.7.0",
  "solana-compute-budget-interface",
