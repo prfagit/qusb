@@ -1,0 +1,38 @@
+ ██████╗ ██╗   ██╗███████╗██████╗
+██╔═══██╗██║   ██║██╔════╝██╔══██╗
+██║   ██║██║   ██║███████╗██████╔╝
+██║▄▄ ██║██║   ██║╚════██║██╔══██╗
+╚██████╔╝╚██████╔╝███████║██████╔╝
+ ╚══▀▀═╝  ╚═════╝ ╚══════╝╚═════╝
+
+This stick is a vault. Not a backup of one. The vault.
+
+Nothing here phones home. Nothing here needs install.
+The program lives in bin/. The secrets will live in qusb/.
+
+FIRST RUN (once, on a machine you trust, ideally offline)
+---------------------------------------------------------
+Open a terminal in this stick's folder, then run the line for your OS.
+<STICK> is this stick's mount path.
+
+  macOS (Apple silicon)   bin/qusb-macos-arm64 init <STICK>
+  macOS (Intel)           bin/qusb-macos-x64 init <STICK>
+  Linux (x64)             bin/qusb-linux-x64 init <STICK>
+  Linux (arm64)           bin/qusb-linux-arm64 init <STICK>
+  Windows (x64)           bin\qusb-windows-x64.exe init <STICK>
+
+macOS/Linux may need: chmod +x bin/qusb-*
+Check the binaries first:  bin/qusb-<os> verify
+
+THE GOLDEN RULES
+----------------
+1. Write the 24 words on paper. Ink. Twice, two places.
+2. Never photograph them. Never type them into anything but qusb.
+3. A vault key signs once. After that it is spent. This is the point.
+4. The classic lane is quantum-exposed. Treat it as a hot pocket,
+   not a safe.
+5. Lose the stick: the words restore everything.
+   Lose the words: nothing does.
+
+https://qusb.app
+https://github.com/prfagit/qusb

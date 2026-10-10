@@ -1,0 +1,35 @@
+[package]
+name = "qvault"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+qusb-wots = { path = "../../crates/qusb-wots", default-features = false }
+pinocchio = "0.11"
+pinocchio-system = "0.6"
+solana-sha256-hasher = "3.1"
+
+[dev-dependencies]
+qusb-wots = { path = "../../crates/qusb-wots" }
+litesvm = "=0.11.0"
+solana-address = { version = "2", features = ["curve25519"] }
+solana-keypair = "3"
+solana-signer = "3"
+solana-transaction = { version = "3", features = ["serde"] }
+solana-message = "3"
+solana-instruction = "3"
+solana-system-interface = "3"
+solana-compute-budget-interface = "3"
+bincode = "1"
+
+# host builds only (tests): lets find_program_address compile off-chain; the SBF build uses the syscall.
+[target.'cfg(not(target_os = "solana"))'.dependencies]
+solana-address = { version = "2", features = ["curve25519"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

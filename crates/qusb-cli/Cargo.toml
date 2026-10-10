@@ -1,0 +1,25 @@
+[package]
+name = "qusb-cli"
+description = "qusb command line"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "qusb"
+path = "src/main.rs"
+
+[dependencies]
+qusb-core = { path = "../qusb-core" }
+clap = { version = "4", features = ["derive", "env"] }
+rpassword = "7"
+qrcode = { version = "0.14", default-features = false }
+ureq = { version = "2", features = ["json"] }
+serde_json = "1"
+base64 = "0.22"
+ed25519-dalek = "2"
+zeroize = "1"
+rand_core = { version = "0.6", features = ["getrandom"] }
+sha2 = "0.10"
+hex = "0.4"
